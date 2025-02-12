@@ -34,6 +34,10 @@ from accelerate.utils import DistributedDataParallelKwargs
 
 from ema_pytorch import EMA
 
+from q_transformer.utils import get_device, to_device, CheckpointManager
+
+import wandb
+
 # constants
 
 QIntermediates = namedtuple('QIntermediates', [
@@ -111,10 +115,18 @@ class QLearner(Module):
         n_step_q_learning = False,
         discount_factor_gamma = 0.98,
         conservative_reg_loss_weight = 1., # they claim 1. is best in paper
-        checkpoint_folder = './checkpoints',
-        checkpoint_every = 1000,
+        checkpoint_dir = './checkpoints',
+        max_checkpoints = 5,
+        save_freq = 1000,
+        use_wandb: bool = True,
+        wandb_project: str = "q-transformer",
+        wandb_entity: str | None = None,
+        wandb_run_name: str | None = None,
+        wandb_config: dict | None = None,
     ):
         super().__init__()
+
+        self.device = get_device(accelerator.device)
 
         self.is_multiple_actions = model.num_actions > 1
 
@@ -196,15 +208,20 @@ class QLearner(Module):
 
         # checkpointing related
 
-        self.checkpoint_every = checkpoint_every
-        self.checkpoint_folder = Path(checkpoint_folder)
-
-        self.checkpoint_folder.mkdir(exist_ok = True, parents = True)
-        assert self.checkpoint_folder.is_dir()
-
-        # dummy loss
-
-        self.register_buffer('zero', torch.tensor(0.))
+        self.checkpoint_manager = CheckpointManager(
+            save_dir=checkpoint_dir,
+            max_checkpoints=max_checkpoints,
+            save_freq=save_freq
+        )
+        
+        # Try to load latest checkpoint
+        metrics, step = self.checkpoint_manager.load_latest_checkpoint(
+            self.model, 
+            self.optimizer
+        )
+        if step > 0:
+            self.step.copy_(torch.tensor(step))
+            self.print(f'Resumed training from step {step}')
 
         # training step related
 
@@ -212,6 +229,27 @@ class QLearner(Module):
         self.grad_accum_every = grad_accum_every
 
         self.register_buffer('step', torch.tensor(0))
+
+        # Initialize wandb
+        self.use_wandb = use_wandb
+        if self.use_wandb and self.is_main:
+            wandb_config = wandb_config or {}
+            wandb.init(
+                project=wandb_project,
+                entity=wandb_entity,
+                name=wandb_run_name,
+                config={
+                    "learning_rate": learning_rate,
+                    "batch_size": batch_size,
+                    "num_train_steps": num_train_steps,
+                    "grad_accum_every": grad_accum_every,
+                    "monte_carlo_return": monte_carlo_return,
+                    "discount_factor_gamma": discount_factor_gamma,
+                    "conservative_reg_loss_weight": conservative_reg_loss_weight,
+                    "model_config": model.config if hasattr(model, 'config') else None,
+                    **wandb_config
+                }
+            )
 
     def save(
         self,
@@ -222,7 +260,7 @@ class QLearner(Module):
         if exists(checkpoint_num):
             name += f'-{checkpoint_num}'
 
-        path = self.checkpoint_folder / (name + '.pt')
+        path = self.checkpoint_manager.save_dir / (name + '.pt')
 
         assert overwrite or not path.exists()
 
@@ -564,62 +602,84 @@ class QLearner(Module):
         min_reward: float | None = None,
         monte_carlo_return: float | None = None
     ):
-        _, _, actions, *_ = args
+        device_type = self.device.type
+        dtype = torch.bfloat16 if device_type == 'mps' else torch.float32
+        
+        with torch.autocast(device_type=device_type, dtype=dtype):
+            # Convert args to appropriate dtype for MPS
+            args = [arg.to(dtype=dtype) if isinstance(arg, torch.Tensor) else arg 
+                   for arg in args]
+            
+            # Ensure all inputs are on correct device
+            args = [to_device(arg, self.device) if torch.is_tensor(arg) else arg for arg in args]
+            
+            device_type = self.device.type
+            with torch.autocast(device_type=device_type, dtype=torch.bfloat16 if device_type == 'mps' else torch.float32):
+                _, _, actions, *_ = args
 
-        # q-learn kwargs
+                # q-learn kwargs
 
-        q_learn_kwargs = dict(
-            monte_carlo_return = monte_carlo_return
-        )
+                q_learn_kwargs = dict(
+                    monte_carlo_return = monte_carlo_return
+                )
 
-        # main q-learning loss, respectively
-        # 1. proposed autoregressive q-learning for multiple actions - (handles single or n-step automatically)
-        # 2. single action - single timestep (classic q-learning)
-        # 3. single action - n-steps
+                # main q-learning loss, respectively
+                # 1. proposed autoregressive q-learning for multiple actions - (handles single or n-step automatically)
+                # 2. single action - single timestep (classic q-learning)
+                # 3. single action - n-steps
 
-        if self.is_multiple_actions:
-            td_loss, q_intermediates = self.autoregressive_q_learn_handle_single_timestep(*args, **q_learn_kwargs)
-            num_timesteps = actions.shape[1]
+                if self.is_multiple_actions:
+                    td_loss, q_intermediates = self.autoregressive_q_learn_handle_single_timestep(*args, **q_learn_kwargs)
+                    num_timesteps = actions.shape[1]
 
-        elif self.n_step_q_learning:
-            td_loss, q_intermediates = self.n_step_q_learn(*args, **q_learn_kwargs)
-            num_timesteps = actions.shape[1]
+                elif self.n_step_q_learning:
+                    td_loss, q_intermediates = self.n_step_q_learn(*args, **q_learn_kwargs)
+                    num_timesteps = actions.shape[1]
 
-        else:
-            td_loss, q_intermediates = self.q_learn(*args, **q_learn_kwargs)
-            num_timesteps = 1
+                else:
+                    td_loss, q_intermediates = self.q_learn(*args, **q_learn_kwargs)
+                    num_timesteps = 1
 
-        if not self.has_conservative_reg_loss:
-            return loss, Losses(td_loss, self.zero)
+                if not self.has_conservative_reg_loss:
+                    return loss, Losses(td_loss, self.zero)
 
-        # calculate conservative regularization
-        # section 4.2 in paper, eq 2
+                # calculate conservative regularization
+                # section 4.2 in paper, eq 2
 
-        batch = actions.shape[0]
+                batch = actions.shape[0]
 
-        q_preds = q_intermediates.q_pred_all_actions
-        q_preds = rearrange(q_preds, '... a -> (...) a')
+                q_preds = q_intermediates.q_pred_all_actions
+                q_preds = rearrange(q_preds, '... a -> (...) a')
 
-        num_action_bins = q_preds.shape[-1]
-        num_non_dataset_actions = num_action_bins - 1
+                num_action_bins = q_preds.shape[-1]
+                num_non_dataset_actions = num_action_bins - 1
 
-        actions = rearrange(actions, '... -> (...) 1')
+                actions = rearrange(actions, '... -> (...) 1')
 
-        dataset_action_mask = torch.zeros_like(q_preds).scatter_(-1, actions, torch.ones_like(q_preds))
+                dataset_action_mask = torch.zeros_like(q_preds).scatter_(-1, actions, torch.ones_like(q_preds))
 
-        q_actions_not_taken = q_preds[~dataset_action_mask.bool()]
-        q_actions_not_taken = rearrange(q_actions_not_taken, '(b t a) -> b t a', b = batch, a = num_non_dataset_actions)
+                q_actions_not_taken = q_preds[~dataset_action_mask.bool()]
+                q_actions_not_taken = rearrange(q_actions_not_taken, '(b t a) -> b t a', b = batch, a = num_non_dataset_actions)
 
-        conservative_reg_loss = ((q_actions_not_taken - (min_reward * num_timesteps)) ** 2).sum() / num_non_dataset_actions
+                conservative_reg_loss = ((q_actions_not_taken - (min_reward * num_timesteps)) ** 2).sum() / num_non_dataset_actions
 
-        # total loss
+                # total loss
 
-        loss =  0.5 * td_loss + \
-                0.5 * conservative_reg_loss * self.conservative_reg_loss_weight
+                loss =  0.5 * td_loss + \
+                        0.5 * conservative_reg_loss * self.conservative_reg_loss_weight
 
-        loss_breakdown = Losses(td_loss, conservative_reg_loss)
+                loss_breakdown = Losses(td_loss, conservative_reg_loss)
 
-        return loss, loss_breakdown
+                return loss, loss_breakdown
+
+    def log_metrics(self, metrics: dict, step: int):
+        """Log metrics to wandb and print to console."""
+        if self.use_wandb and self.is_main:
+            wandb.log(metrics, step=step)
+        
+        # Print key metrics
+        metrics_str = " | ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
+        self.print(f"Step {step}: {metrics_str}")
 
     def forward(
         self,
@@ -680,14 +740,31 @@ class QLearner(Module):
             step += 1
             self.step.add_(1)
 
-            # whether to checkpoint or not
+            # Log detailed metrics
+            metrics = {
+                'training/td_loss': td_loss.item(),
+                'training/conservative_reg_loss': conservative_reg_loss.item(),
+                'training/total_loss': loss.item(),
+                'training/learning_rate': self.optimizer.param_groups[0]['lr'],
+                'training/epsilon': self.model.get_epsilon(step) if hasattr(self.model, 'get_epsilon') else 0,
+            }
+            
+            # Add gradient norm metrics
+            if self.is_main:
+                grad_norm = self.accelerator.grad_norm(self.model.parameters())
+                metrics['training/gradient_norm'] = grad_norm
+            
+            # Log metrics
+            self.log_metrics(metrics, step)
+            
+            # Save checkpoint with metrics
+            self.checkpoint_manager.save_checkpoint(
+                self.model,
+                self.optimizer,
+                step,
+                metrics
+            )
 
-            self.wait()
-
-            if self.is_main and is_divisible(step, self.checkpoint_every):
-                checkpoint_num = step // self.checkpoint_every
-                self.save(checkpoint_num)
-
-            self.wait()
-
+        if self.use_wandb and self.is_main:
+            wandb.finish()
         self.print('training complete')

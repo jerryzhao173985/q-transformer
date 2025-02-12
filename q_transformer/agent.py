@@ -21,6 +21,10 @@ from beartype.typing import Iterator
 
 from tqdm import tqdm
 
+from q_transformer.utils import get_device, to_device, check_mps_compatibility, safe_to_device
+
+import wandb
+
 # just force training on 64 bit systems
 
 assert sys.maxsize > (2 ** 32), 'you need to be on 64 bit system to store > 2GB experience for your q-transformer agent'
@@ -50,7 +54,8 @@ class ReplayMemoryDataset(Dataset):
     def __init__(
         self,
         folder: str = DEFAULT_REPLAY_MEMORIES_FOLDER,
-        num_timesteps: int = 1
+        num_timesteps: int = 1,
+        device=None
     ):
         assert num_timesteps >= 1
         self.is_single_timestep = num_timesteps == 1
@@ -65,6 +70,7 @@ class ReplayMemoryDataset(Dataset):
         rewards_path = folder / REWARDS_FILENAME
         dones_path = folder / DONES_FILENAME
 
+        self.device = get_device(device)
         self.text_embeds = open_memmap(str(text_embeds_path), dtype = 'float32', mode = 'r')
         self.states = open_memmap(str(states_path), dtype = 'float32', mode = 'r')
         self.actions = open_memmap(str(actions_path), dtype = 'int', mode = 'r')
@@ -107,18 +113,46 @@ class ReplayMemoryDataset(Dataset):
 
     def __getitem__(self, idx):
         episode_index, timestep_index = self.indices[idx]
-
         timestep_slice = slice(timestep_index, (timestep_index + self.num_timesteps))
 
-        text_embeds = self.text_embeds[episode_index, timestep_slice].copy()
-        states = self.states[episode_index, timestep_slice].copy()
-        actions = self.actions[episode_index, timestep_slice].copy()
-        rewards = self.rewards[episode_index, timestep_slice].copy()
-        dones = self.dones[episode_index, timestep_slice].copy()
+        # Ensure proper dtype conversion for MPS
+        text_embeds = safe_to_device(
+            torch.from_numpy(self.text_embeds[episode_index, timestep_slice].copy()),
+            self.device,
+            dtype=torch.float32
+        )
+        states = safe_to_device(
+            torch.from_numpy(self.states[episode_index, timestep_slice].copy()),
+            self.device,
+            dtype=torch.float32
+        )
+        actions = safe_to_device(
+            torch.from_numpy(self.actions[episode_index, timestep_slice].copy()),
+            self.device,
+            dtype=torch.int32
+        )
+        rewards = safe_to_device(
+            torch.from_numpy(self.rewards[episode_index, timestep_slice].copy()),
+            self.device,
+            dtype=torch.float32
+        )
+        dones = safe_to_device(
+            torch.from_numpy(self.dones[episode_index, timestep_slice].copy()),
+            self.device,
+            dtype=torch.bool
+        )
 
-        next_state_timestep = min(timestep_index, self.max_episode_len - 1)
-        next_state = self.states[episode_index, next_state_timestep].copy()
-        next_text_embed = self.text_embeds[episode_index, next_state_timestep].copy()
+        next_state_timestep = min(timestep_index + self.num_timesteps, self.max_episode_len - 1)
+        next_state = safe_to_device(
+            torch.from_numpy(self.states[episode_index, next_state_timestep].copy()),
+            self.device,
+            dtype=torch.float32
+        )
+        next_text_embed = safe_to_device(
+            torch.from_numpy(self.text_embeds[episode_index, next_state_timestep].copy()),
+            self.device,
+            dtype=torch.float32
+        )
 
         return text_embeds, states, actions, next_state, next_text_embed, rewards, dones
 
@@ -130,12 +164,18 @@ class BaseEnvironment(Module):
         self,
         *,
         state_shape: tuple[int, ...],
-        text_embed_shape: int | tuple[int, ...]
+        text_embed_shape: int | tuple[int, ...],
+        device: torch.device | None = None
     ):
         super().__init__()
         self.state_shape = state_shape
         self.text_embed_shape = cast_tuple(text_embed_shape)
-        self.register_buffer('dummy', torch.zeros(0), persistent = False)
+        
+        # Always default to MPS if available
+        if device is None:
+            device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+            
+        self.register_buffer('dummy', torch.zeros(0, device=device), persistent=False)
 
     @property
     def device(self):
@@ -168,15 +208,24 @@ class Agent(Module):
         max_num_steps_per_episode: int = 10000,
         epsilon_start: float = 0.25,
         epsilon_end: float = 0.001,
-        num_steps_to_target_epsilon: int = 1000
+        num_steps_to_target_epsilon: int = 1000,
+        device: torch.device | None = None,
+        use_wandb: bool = True,
+        wandb_project: str = "q-transformer",
+        wandb_entity: str | None = None,
     ):
         super().__init__()
-        self.q_transformer = q_transformer
-    
+        
+        # Set up device
+        if device is None:
+            device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        
+        self.device = device
+        self.q_transformer = q_transformer.to(device)
+        self.environment = environment
+        
         condition_on_text = q_transformer.condition_on_text
         self.condition_on_text = condition_on_text
-
-        self.environment = environment
 
         assert hasattr(environment, 'state_shape') and hasattr(environment, 'text_embed_shape')
 
@@ -218,28 +267,67 @@ class Agent(Module):
         self.rewards     = open_memmap(str(rewards_path), dtype = 'float32', mode = 'w+', shape = prec_shape)
         self.dones       = open_memmap(str(dones_path), dtype = 'bool', mode = 'w+', shape = prec_shape)
 
+        self.use_wandb = use_wandb
+        if self.use_wandb:
+            if not wandb.run:
+                wandb.init(project=wandb_project, entity=wandb_entity)
+
     def get_epsilon(self, step):
         return max(self.epsilon_end, self.epsilon_slope * float(step) + self.epsilon_start)
 
+    def log_episode_metrics(self, episode: int, episode_rewards: list, episode_actions: list):
+        """Log episode-level metrics to wandb."""
+        if not self.use_wandb:
+            return
+            
+        metrics = {
+            'episode': episode,
+            'environment/episode_reward': sum(episode_rewards),
+            'environment/episode_length': len(episode_rewards),
+            'environment/mean_reward': sum(episode_rewards) / len(episode_rewards),
+            'environment/min_reward': min(episode_rewards),
+            'environment/max_reward': max(episode_rewards),
+        }
+        
+        # Log action distribution
+        if len(episode_actions) > 0:
+            action_dist = torch.tensor(episode_actions).float()
+            metrics.update({
+                'environment/mean_action': action_dist.mean().item(),
+                'environment/action_std': action_dist.std().item()
+            })
+            
+            # Create action distribution histogram
+            wandb.log({
+                "environment/action_distribution": wandb.Histogram(action_dist.cpu().numpy()),
+                **metrics
+            }, step=episode)
+        
     @beartype
     @torch.no_grad()
     def forward(self):
+        # Verify MPS compatibility at start of training
+        if self.device.type == 'mps':
+            assert check_mps_compatibility(), "MPS device is not working correctly"
+            
         self.q_transformer.eval()
-
+        
         for episode in range(self.num_episodes):
-            print(f'episode {episode}')
-
+            episode_rewards = []
+            episode_actions = []
+            
+            # Ensure all tensors are on correct device
             instruction, curr_state = self.environment.init()
-
+            curr_state = safe_to_device(curr_state, self.device)
+            
             for step in tqdm(range(self.max_num_steps_per_episode)):
+                if self.condition_on_text:
+                    text_embed = self.q_transformer.embed_texts([instruction])
+                    text_embed = safe_to_device(text_embed, self.device)
+                
                 last_step = step == (self.max_num_steps_per_episode - 1)
 
                 epsilon = self.get_epsilon(step)
-
-                text_embed = None
-
-                if self.condition_on_text:
-                    text_embed = self.q_transformer.embed_texts([instruction])
 
                 actions = self.q_transformer.get_actions(
                     rearrange(curr_state, '... -> 1 ...'),
@@ -251,29 +339,31 @@ class Agent(Module):
 
                 done = done | last_step
 
-                # store memories using memmap, for later reflection and learning
-
+                # Move tensors to CPU before storing in memmap
                 if self.condition_on_text:
                     assert text_embed.shape[1:] == self.text_embed_shape
-                    self.text_embeds[episode, step] = text_embed
+                    self.text_embeds[episode, step] = text_embed.cpu().numpy()
 
-                self.states[episode, step]      = curr_state
-                self.actions[episode, step]     = actions
-                self.rewards[episode, step]     = reward
-                self.dones[episode, step]       = done
+                self.states[episode, step] = curr_state.cpu().numpy()
+                self.actions[episode, step] = actions.cpu().numpy()
+                self.rewards[episode, step] = reward.cpu().numpy()
+                self.dones[episode, step] = done.cpu().numpy()
 
-                # if done, move onto next episode
+                episode_rewards.append(reward.item())
+                episode_actions.append(actions.cpu().numpy())
 
                 if done:
                     break
 
-                # set next state
-
                 curr_state = next_state
 
+            # Log episode metrics
+            self.log_episode_metrics(episode, episode_rewards, episode_actions)
+            
+            # Flush after each episode
             if self.condition_on_text:
                 self.text_embeds.flush()
-
+            
             self.states.flush()
             self.actions.flush()
             self.rewards.flush()
@@ -290,3 +380,6 @@ class Agent(Module):
         del self.dones
 
         print(f'completed, memories stored to {self.memories_dataset_folder.resolve()}')
+
+        if self.use_wandb:
+            wandb.finish()

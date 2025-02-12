@@ -27,6 +27,10 @@ from classifier_free_guidance_pytorch import (
 
 from hyper_connections import get_init_and_expand_reduce_stream_functions
 
+from q_transformer.utils import get_device, safe_to_device
+
+from pathlib import Path
+
 # helpers
 
 def exists(val):
@@ -75,20 +79,18 @@ def maybe_reduce_mask_and(*maybe_masks):
 class RotaryEmbedding(Module):
     def __init__(self, dim, omega = 10000):
         super().__init__()
-        inv_freq = 1.0 / (omega ** (torch.arange(0, dim, 4).float() / dim))
+        # Ensure consistent dtype for MPS
+        inv_freq = 1.0 / (omega ** (torch.arange(0, dim, 4, dtype=torch.float32) / dim))
         self.register_buffer('inv_freq', inv_freq)
 
-    @autocast('cuda', enabled = False)
     def forward(self, height_width):
         device, dtype = self.inv_freq.device, self.inv_freq.dtype
-
-        axial_pos = torch.arange(height_width, device = device).type(dtype)
-
+        # Ensure consistent dtype for axial positions
+        axial_pos = torch.arange(height_width, device=device, dtype=torch.float32)
         freqs = torch.einsum('i, j -> i j', axial_pos, self.inv_freq)
-        freqs = repeat(freqs, '... f -> ... (f c)', c = 2)
-
+        freqs = repeat(freqs, '... f -> ... (f c)', c=2)
         freqs = torch.broadcast_tensors(freqs[None, :, :], freqs[:, None, :])
-        freqs = torch.cat(freqs, dim = -1)
+        freqs = torch.cat(freqs, dim=-1)
         return rearrange(freqs, '... f -> (...) f')
 
 def rotate_half(x):
@@ -132,14 +134,15 @@ class ChanRMSNorm(Module):
 
 # sinusoidal positions
 
-def posemb_sincos_1d(seq, dim, temperature = 10000, device = None, dtype = torch.float32):
-    n = torch.arange(seq, device = device)
-    omega = torch.arange(dim // 2, device = device) / (dim // 2 - 1)
+def posemb_sincos_1d(seq, dim, temperature=10000, device=None, dtype=torch.float32):
+    device = get_device(device)  # Use our utility function
+    n = torch.arange(seq, device=device)
+    omega = torch.arange(dim // 2, device=device) / (dim // 2 - 1)
     omega = 1. / (temperature ** omega)
-
+    
     n = n[:, None] * omega[None, :]
-    pos_emb = torch.cat((n.sin(), n.cos()), dim = 1)
-    return pos_emb.type(dtype)
+    pos_emb = torch.cat((n.sin(), n.cos()), dim=1)
+    return pos_emb.type(dtype).to(device)
 
 # helper classes
 
@@ -573,6 +576,7 @@ class TransformerAttention(Module):
         return_cache = False
     ):
         b = x.shape[0]
+        device = x.device
 
         assert xnor(exists(context), exists(self.context_norm))
 
@@ -618,6 +622,9 @@ class TransformerAttention(Module):
             attn_mask = rearrange(attn_mask, 'i j -> 1 1 i j')
 
         attn_mask = maybe_reduce_mask_and(mask, attn_mask)
+
+        if exists(attn_mask):
+            attn_mask = attn_mask.to(device)  # Ensure mask is on correct device
 
         out, _ = self.attend(q, k, v, mask = attn_mask)
 
@@ -1054,10 +1061,14 @@ class QRoboticTransformer(Module):
             attn_dim_head = 64,
             attn_depth = 2
         ),
-        weight_tie_action_bin_embed = True      # when projecting to action bin Q values, whether to weight tie to original embeddings
+        weight_tie_action_bin_embed = True,      # when projecting to action bin Q values, whether to weight tie to original embeddings
+        device=None
     ):
         super().__init__()
-
+        
+        # Instead of setting device directly, use a buffer
+        self.register_buffer('_device_tensor', torch.zeros(1, device=get_device(device)), persistent=False)
+        
         # vit
 
         if isinstance(vit, dict):
@@ -1136,9 +1147,31 @@ class QRoboticTransformer(Module):
                 **q_head_attn_kwargs
             )
 
+        self.config = dict(
+            vit=vit,
+            num_actions=num_actions,
+            action_bins=action_bins,
+            depth=depth,
+            heads=heads,
+            dim_head=dim_head,
+            token_learner_ff_mult=token_learner_ff_mult,
+            token_learner_num_layers=token_learner_num_layers,
+            token_learner_num_output_tokens=token_learner_num_output_tokens,
+            cond_drop_prob=cond_drop_prob,
+            use_attn_conditioner=use_attn_conditioner,
+            conditioner_kwargs=conditioner_kwargs,
+            dueling=dueling,
+            flash_attn=flash_attn,
+            condition_on_text=condition_on_text,
+            num_residual_streams=num_residual_streams,
+            q_head_attn_kwargs=q_head_attn_kwargs,
+            weight_tie_action_bin_embed=weight_tie_action_bin_embed,
+            device=device
+        )
+
     @property
     def device(self):
-        return next(self.parameters()).device
+        return self._device_tensor.device
 
     def get_random_actions(self, batch_size = 1):
         return self.q_head.get_random_actions(batch_size)
@@ -1191,9 +1224,12 @@ class QRoboticTransformer(Module):
         n - number of learned tokens
         """
 
-        # just auto-move inputs to the same device as robotic transformer
-
-        video = video.to(self.device)
+        # Use self.device property
+        video = safe_to_device(video, self.device)
+        if text_embeds is not None:
+            text_embeds = safe_to_device(text_embeds, self.device)
+        if actions is not None:
+            actions = safe_to_device(actions, self.device)
 
         if exists(actions):
             actions = actions.to(self.device)
@@ -1289,3 +1325,19 @@ class QRoboticTransformer(Module):
             q_value_logits = self.q_head(encoded_state, actions = actions)
 
         return q_value_logits
+
+    @classmethod
+    def load_from_checkpoint(cls, checkpoint_path, **model_kwargs):
+        """Load a model from a checkpoint file."""
+        checkpoint_path = Path(checkpoint_path)
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"No checkpoint found at {checkpoint_path}")
+            
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            model = cls(**model_kwargs)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"Loaded checkpoint from step {checkpoint['step']}")
+            return model
+        except Exception as e:
+            raise Exception(f"Error loading checkpoint: {str(e)}")
